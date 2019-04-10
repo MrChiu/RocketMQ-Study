@@ -441,6 +441,7 @@ public class DefaultMessageStore implements MessageStore {
         return result;
     }
 
+    @Override
     public PutMessageResult putMessages(MessageExtBatch messageExtBatch) {
         if (this.shutdown) {
             log.warn("DefaultMessageStore has shutdown, so putMessages is forbidden");
@@ -1379,6 +1380,9 @@ public class DefaultMessageStore implements MessageStore {
 
     /**
      * 文件恢复
+     * 主要完成flushedPosition，committedWhere指针的设置，消息消费队列最大偏移量加载到内存，
+     * 并删除flushedPosition之后所有的文件。如果Broker异常启动，在文件恢复过程中，RocketMQ会将最后一个有效文件中的
+     * 所有消息重新转发到消息消费队列和索引文件中，确保不丢失消息，但同时会带来消息重复的问题
      * @param lastExitOK
      */
     private void recover(final boolean lastExitOK) {

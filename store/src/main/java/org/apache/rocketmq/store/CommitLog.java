@@ -421,16 +421,21 @@ public class CommitLog {
         this.confirmOffset = phyOffset;
     }
 
+    /**
+     * 异常停止文件恢复
+     * @param maxPhyOffsetOfConsumeQueue
+     */
     public void recoverAbnormally(long maxPhyOffsetOfConsumeQueue) {
         // recover by the minimum time stamp
         boolean checkCRCOnRecover = this.defaultMessageStore.getMessageStoreConfig().isCheckCRCOnRecover();
         final List<MappedFile> mappedFiles = this.mappedFileQueue.getMappedFiles();
         if (!mappedFiles.isEmpty()) {
-            // Looking beginning to recover from which file
+            // 从最后一个文件往前走，找到第一个消息存储正常的文件
             int index = mappedFiles.size() - 1;
             MappedFile mappedFile = null;
             for (; index >= 0; index--) {
                 mappedFile = mappedFiles.get(index);
+                //判断一个消息文件是一个正确的文件
                 if (this.isMappedFileMatchedRecover(mappedFile)) {
                     log.info("recover from this mapped file " + mappedFile.getFileName());
                     break;
@@ -446,6 +451,7 @@ public class CommitLog {
             long processOffset = mappedFile.getFileFromOffset();
             long mappedFileOffset = 0;
             while (true) {
+                //遍历选中的MappedFile中的消息，验证消息合法性，并将消息重新转发到消息消费队列与索引文件
                 DispatchRequest dispatchRequest = this.checkMessageAndReturnSize(byteBuffer, checkCRCOnRecover);
                 int size = dispatchRequest.getMsgSize();
 
@@ -498,6 +504,8 @@ public class CommitLog {
             }
         }
         // Commitlog case files are deleted
+        //如果未找到有效的MappedFile，则设置commitlog目录的flushedWhere，committedWhere指针未0
+        // 并销毁消息消费队列文件
         else {
             this.mappedFileQueue.setFlushedWhere(0);
             this.mappedFileQueue.setCommittedWhere(0);
@@ -505,28 +513,39 @@ public class CommitLog {
         }
     }
 
+    /**
+     * 校验文件是否是正确文件
+     * @param mappedFile
+     * @return
+     */
     private boolean isMappedFileMatchedRecover(final MappedFile mappedFile) {
         ByteBuffer byteBuffer = mappedFile.sliceByteBuffer();
 
+        //首先判断文件的魔数，如果不是MESSAGE_MAGIC_CODE，返回false，表示该文件不符合commitlog消息文件的存储格式
         int magicCode = byteBuffer.getInt(MessageDecoder.MESSAGE_MAGIC_CODE_POSTION);
         if (magicCode != MESSAGE_MAGIC_CODE) {
             return false;
         }
 
+        //校验存储时间，为0说明该消息存储文件未存储任何消息
         long storeTimestamp = byteBuffer.getLong(MessageDecoder.MESSAGE_STORE_TIMESTAMP_POSTION);
         if (0 == storeTimestamp) {
             return false;
         }
 
+        //对比文件第一条消息的时间戳与检测点，文件第一条消息的时间戳小于文件检测点说明该文件部分消息是可靠的，
+        // 则从该文件开始恢复
         if (this.defaultMessageStore.getMessageStoreConfig().isMessageIndexEnable()
             && this.defaultMessageStore.getMessageStoreConfig().isMessageIndexSafe()) {
+            //如果开启了messageIndexEnable与messageIndexSafe，表示索引文件的刷盘时间点也参与计算
             if (storeTimestamp <= this.defaultMessageStore.getStoreCheckpoint().getMinTimestampIndex()) {
                 log.info("find check timestamp, {} {}",
-                    storeTimestamp,
-                    UtilAll.timeMillisToHumanString(storeTimestamp));
+                    storeTimestamp, UtilAll.timeMillisToHumanString(storeTimestamp));
                 return true;
             }
         } else {
+            //文件检测点中保存了Commitlog文件，消息消费队列，索引文件的文件刷盘点，
+            // 默认选择消息文件与消息消费队列这两个文件的时间刷盘点中最小值与消息文件第一消息的时间戳对比
             if (storeTimestamp <= this.defaultMessageStore.getStoreCheckpoint().getMinTimestamp()) {
                 log.info("find check timestamp, {} {}",
                     storeTimestamp,
@@ -679,14 +698,22 @@ public class CommitLog {
         return putMessageResult;
     }
 
+    /**
+     * 刷盘机制
+     * @param result
+     * @param putMessageResult
+     * @param messageExt
+     */
     public void handleDiskFlush(AppendMessageResult result, PutMessageResult putMessageResult, MessageExt messageExt) {
-        // Synchronization flush
+        // Synchronization flush 刷盘方式
         if (FlushDiskType.SYNC_FLUSH == this.defaultMessageStore.getMessageStoreConfig().getFlushDiskType()) {
             final GroupCommitService service = (GroupCommitService) this.flushCommitLogService;
             if (messageExt.isWaitStoreMsgOK()) {
+                //构建GroupCommitRequest同步任务并提交到GroupCommitService
                 GroupCommitRequest request = new GroupCommitRequest(result.getWroteOffset() + result.getWroteBytes());
                 service.putRequest(request);
                 boolean flushOK = request.waitForFlush(this.defaultMessageStore.getMessageStoreConfig().getSyncFlushTimeout());
+                //等待同步刷盘任务完成，如果超时返回刷盘错误，刷盘成功后正常返回给调用方
                 if (!flushOK) {
                     log.error("do groupcommit, wait for flush failed, topic: " + messageExt.getTopic() + " tags: " + messageExt.getTags()
                         + " client address: " + messageExt.getBornHostString());
@@ -1077,9 +1104,15 @@ public class CommitLog {
         }
     }
 
+    /**
+     * 聚合提交请求
+     */
     public static class GroupCommitRequest {
+        //刷盘点偏移量
         private final long nextOffset;
+        //倒计数锁存器
         private final CountDownLatch countDownLatch = new CountDownLatch(1);
+        //刷盘结果
         private volatile boolean flushOK = false;
 
         public GroupCommitRequest(long nextOffset) {
@@ -1090,11 +1123,20 @@ public class CommitLog {
             return nextOffset;
         }
 
+        /**
+         * 将消息发送线程唤醒，并将刷盘告知GroupCommitRequest
+         * @param flushOK
+         */
         public void wakeupCustomer(final boolean flushOK) {
             this.flushOK = flushOK;
             this.countDownLatch.countDown();
         }
 
+        /**
+         * 等待刷盘结果
+         * @param timeout
+         * @return
+         */
         public boolean waitForFlush(long timeout) {
             try {
                 this.countDownLatch.await(timeout, TimeUnit.MILLISECONDS);
@@ -1110,9 +1152,15 @@ public class CommitLog {
      * GroupCommit Service
      */
     class GroupCommitService extends FlushCommitLogService {
+        //同步刷盘任务暂存容器
         private volatile List<GroupCommitRequest> requestsWrite = new ArrayList<GroupCommitRequest>();
+        //GroupCommitService线程每次处理的request容器，这是一个设计亮点，避免了任务提交与任务执行的锁冲突
         private volatile List<GroupCommitRequest> requestsRead = new ArrayList<GroupCommitRequest>();
 
+        /**
+         * 客户端提交同步刷盘任务到GroupCommitService线程，如果该线程处于等待状态则将其唤醒
+         * @param request
+         */
         public synchronized void putRequest(final GroupCommitRequest request) {
             synchronized (this.requestsWrite) {
                 this.requestsWrite.add(request);
@@ -1122,6 +1170,10 @@ public class CommitLog {
             }
         }
 
+        /**
+         * 由于避免同步刷盘消息任务与其他消息生产者提交任务直接的锁竞争，GroupCommitService
+         * 提供了读容器和写容器，这两个容器每次执行完一次任务后，交互，继续消费任务
+         */
         private void swapRequests() {
             List<GroupCommitRequest> tmp = this.requestsWrite;
             this.requestsWrite = this.requestsRead;
@@ -1160,6 +1212,7 @@ public class CommitLog {
             }
         }
 
+        @Override
         public void run() {
             CommitLog.log.info(this.getServiceName() + " service started");
 

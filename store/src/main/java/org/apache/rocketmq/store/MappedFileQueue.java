@@ -121,23 +121,35 @@ public class MappedFileQueue {
         return mfs;
     }
 
+    /**
+     * 删除
+     * @param offset
+     */
     public void truncateDirtyFiles(long offset) {
         List<MappedFile> willRemoveFiles = new ArrayList<MappedFile>();
 
+        //遍历目录下的文件
         for (MappedFile file : this.mappedFiles) {
+            //文件尾部偏移量
             long fileTailOffset = file.getFileFromOffset() + this.mappedFileSize;
+            //如果尾部偏移量大于offset
             if (fileTailOffset > offset) {
+                //进一步比较offset与文件的开始偏移量
                 if (offset >= file.getFileFromOffset()) {
+                    //如果大于，说明当前文件包含了有效偏移量
                     file.setWrotePosition((int) (offset % this.mappedFileSize));
                     file.setCommittedPosition((int) (offset % this.mappedFileSize));
                     file.setFlushedPosition((int) (offset % this.mappedFileSize));
                 } else {
+                    //如果小于，说明该文件是有效文件后面创建的，
+                    // 调用destory释放MappedFile占用的内存资源（内存映射与内存通道等）
                     file.destroy(1000);
+                    //加入待删除文件列表中
                     willRemoveFiles.add(file);
                 }
             }
         }
-
+        //最终调用deleteExpiredFile将文件从物理磁盘删除
         this.deleteExpiredFile(willRemoveFiles);
     }
 
